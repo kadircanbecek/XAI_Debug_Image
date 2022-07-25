@@ -1,4 +1,3 @@
 data
 mnist_data
 **/*.pt
-*.png
