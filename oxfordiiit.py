@@ -1,8 +1,10 @@
+import glob
 import os.path
 import shutil
 
 import rasterio.features
 from shapely import geometry
+from tqdm import tqdm
 
 from ResNet import resnet_init
 from concavehull_scipy import alpha_shape
@@ -45,7 +47,15 @@ BATCH_SIZE = 32
 N_EPOCHS = 40
 
 IMG_SIZE = 224
-N_CLASSES = 37
+N_CLASSES = 2
+
+
+class TrainingInterrupt(Exception):
+    def __init__(self, epochs, model, optimizer):
+        super(TrainingInterrupt, self).__init__()
+        self.epochs = epochs
+        self.model = model
+        self.optimizer = optimizer
 
 
 def train(train_loader, model, criterion, optimizer, device):
@@ -55,8 +65,10 @@ def train(train_loader, model, criterion, optimizer, device):
 
     model.train()
     running_loss = 0
+    correct_pred = 0
+    n = 0
 
-    for X, y_true in train_loader:
+    for i, (X, y_true) in tqdm(enumerate(train_loader), total=len(train_loader)):
         optimizer.zero_grad()
 
         X = X.to(device)
@@ -71,8 +83,15 @@ def train(train_loader, model, criterion, optimizer, device):
         loss.backward()
         optimizer.step()
 
+        _, predicted_labels = torch.max(y_hat, 1)
+
+        n += y_true.size(0)
+        correct_pred += (predicted_labels == y_true).sum()
+
     epoch_loss = running_loss / len(train_loader.dataset)
-    return model, optimizer, epoch_loss
+    accuracy = correct_pred.float() / n
+
+    return model, optimizer, epoch_loss, accuracy
 
 
 def validate(valid_loader, model, criterion, device):
@@ -82,8 +101,10 @@ def validate(valid_loader, model, criterion, device):
 
     model.eval()
     running_loss = 0
+    correct_pred = 0
+    n = 0
 
-    for X, y_true in valid_loader:
+    for i, (X, y_true) in tqdm(enumerate(valid_loader), total=len(valid_loader)):
         X = X.to(device)
         y_true = y_true.to(device)
 
@@ -91,33 +112,15 @@ def validate(valid_loader, model, criterion, device):
         y_hat = model(X)
         loss = criterion(y_hat, y_true)
         running_loss += loss.item() * X.size(0)
+        _, predicted_labels = torch.max(y_hat, 1)
+
+        n += y_true.size(0)
+        correct_pred += (predicted_labels == y_true).sum()
 
     epoch_loss = running_loss / len(valid_loader.dataset)
+    accuracy = correct_pred.float() / n
 
-    return model, epoch_loss
-
-
-def get_accuracy(model, data_loader, device):
-    '''
-    Function for computing the accuracy of the predictions over the entire data_loader
-    '''
-
-    correct_pred = 0
-    n = 0
-
-    with torch.no_grad():
-        model.eval()
-        for X, y_true in data_loader:
-            X = X.to(device)
-            y_true = y_true.to(device)
-
-            y_prob = model(X)
-            _, predicted_labels = torch.max(y_prob, 1)
-
-            n += y_true.size(0)
-            correct_pred += (predicted_labels == y_true).sum()
-
-    return correct_pred.float() / n
+    return model, epoch_loss, accuracy
 
 
 def plot_losses(train_losses, valid_losses):
@@ -145,7 +148,8 @@ def plot_losses(train_losses, valid_losses):
     plt.style.use('default')
 
 
-def training_loop(model, criterion, optimizer, train_loader, valid_loader, epochs, device, print_every=1):
+def training_loop(model, criterion, optimizer, train_loader, valid_loader, epochs, device, print_every=1,
+                  start_epoch=0):
     '''
     Function defining the entire training loop
     '''
@@ -156,20 +160,17 @@ def training_loop(model, criterion, optimizer, train_loader, valid_loader, epoch
     valid_losses = []
 
     # Train model
-    for epoch in range(0, epochs):
+    for epoch in range(start_epoch, epochs):
 
-        # training
-        model, optimizer, train_loss = train(train_loader, model, criterion, optimizer, device)
-        train_losses.append(train_loss)
+        try:
+            # training
+            model, optimizer, train_loss, train_acc = train(train_loader, model, criterion, optimizer, device)
+            train_losses.append(train_loss)
 
-        # validation
-        with torch.no_grad():
-            model, valid_loss = validate(valid_loader, model, criterion, device)
-            valid_losses.append(valid_loss)
-
-        if epoch % print_every == (print_every - 1):
-            train_acc = get_accuracy(model, train_loader, device=device)
-            valid_acc = get_accuracy(model, valid_loader, device=device)
+            # validation
+            with torch.no_grad():
+                model, valid_loss, valid_acc = validate(valid_loader, model, criterion, device)
+                valid_losses.append(valid_loss)
 
             print(f'{datetime.now().time().replace(microsecond=0)} --- '
                   f'Epoch: {epoch}\t'
@@ -177,6 +178,8 @@ def training_loop(model, criterion, optimizer, train_loader, valid_loader, epoch
                   f'Valid loss: {valid_loss:.4f}\t'
                   f'Train accuracy: {100 * train_acc:.2f}\t'
                   f'Valid accuracy: {100 * valid_acc:.2f}')
+        except KeyboardInterrupt:
+            raise TrainingInterrupt(epoch, model, optimizer)
 
     plot_losses(train_losses, valid_losses)
 
@@ -211,13 +214,28 @@ valid_transform2 = transforms.Compose(
     [transforms.Resize((IMG_SIZE, IMG_SIZE)),
      transforms.ToTensor()])
 
+
 # download and create datasets
-train_dataset = datasets.OxfordIIITPet(root='./data', split="trainval",
-                                       download=True, transform=train_transform)
-val_dataset = datasets.OxfordIIITPet(root='./data', split="test",
-                                     download=True, transform=valid_transform)
-val_dataset2 = datasets.OxfordIIITPet(root='./data', split="test",
-                                      download=True, transform=valid_transform2)
+
+
+class WorkaroundDataset(datasets.OxfordIIITPet):
+    def __init__(self, root, split, download, transform):
+        super(WorkaroundDataset, self).__init__(root=root, split=split, download=download, transform=transform)
+        self.classes = ["Cat", "Dog"]
+        self.class_to_idx = {k: v for k, v in enumerate(self.classes)}
+
+    def __getitem__(self, idx):
+        item = list(super(WorkaroundDataset, self).__getitem__(idx))
+        item[1] = 0 if item[1] in [0, 5, 6, 7, 9, 11, 20, 23, 26, 27, 32, 33] else 1
+        return tuple(item)
+
+
+train_dataset = WorkaroundDataset(root='./data', split="trainval",
+                                  download=True, transform=train_transform)
+val_dataset = WorkaroundDataset(root='./data', split="test",
+                                download=True, transform=valid_transform)
+val_dataset2 = WorkaroundDataset(root='./data', split="test",
+                                 download=True, transform=valid_transform2)
 
 # train_ds, test_ds = random_split(dataset, 0.9, random_state=42)
 # define the data loaders
@@ -231,7 +249,6 @@ valid_loader = DataLoader(dataset=val_dataset,
 valid_loader2 = DataLoader(dataset=val_dataset2,
                            batch_size=1,
                            shuffle=True)
-
 
 classes = val_dataset.classes
 
@@ -259,33 +276,59 @@ classes = val_dataset.classes
 #         x = self.fc3(x)
 #         return x
 
-model = resnet_init(18, 37)
+layers = 18
+model = resnet_init(layers, len(train_dataset.classes))
 
 torch.manual_seed(RANDOM_SEED)
-if not os.path.exists("oxfordiiitpet.pt"):
-    model.to(DEVICE)
+torch.cuda.manual_seed(RANDOM_SEED)
+if not glob.glob(f"oxfordiiit-{layers}/*.pt"):
+    if os.path.exists(f"oxfordiiit-{layers}/"):
+        shutil.rmtree(f"oxfordiiit-{layers}")
+    os.mkdir(f"oxfordiiit-{layers}/")
+    model = model.to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     criterion = nn.CrossEntropyLoss()
 
-    model, optimizer, _ = training_loop(model, criterion, optimizer, train_loader, valid_loader, N_EPOCHS, DEVICE)
-    torch.save(model.state_dict(), "oxfordiiitpet.pt")
+    try:
+        model, optimizer, _ = training_loop(model, criterion, optimizer, train_loader, valid_loader, N_EPOCHS, DEVICE)
+        torch.save(model.state_dict(), f"oxfordiiit-{layers}/epoch-{str(N_EPOCHS).zfill(2)}.pt")
+        torch.save(optimizer.state_dict(), f"oxfordiiit-{layers}/optimizer.pt")
+    except TrainingInterrupt as ti:
+        if ti.epochs > 0:
+            torch.save(ti.model.state_dict(), f"oxfordiiit-{layers}/epoch-{str(ti.epochs).zfill(2)}.pt")
+            torch.save(ti.optimizer.state_dict(), f"oxfordiiit-{layers}/optimizer.pt")
+        raise KeyboardInterrupt
+elif int(os.path.basename(sorted(glob.glob(f"oxfordiiit-{layers}/epoch-*.pt"))[-1]).split(".")[0].split("-")[
+             -1]) < N_EPOCHS:
+    model.load_state_dict(torch.load(sorted(glob.glob(f"oxfordiiit-{layers}/epoch-*.pt"))[-1]))
+    model.to(DEVICE)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer.load_state_dict(torch.load(f"oxfordiiit-{layers}/optimizer.pt"))
+    epoch = int(os.path.basename(sorted(glob.glob(f"oxfordiiit-{layers}/epoch-*.pt"))[-1]).split(".")[0].split("-")[-1])
+    try:
+        model, optimizer, _ = training_loop(model, criterion, optimizer, train_loader, valid_loader, N_EPOCHS, DEVICE,
+                                            start_epoch=epoch)
+        torch.save(model.state_dict(), f"oxfordiiit-{layers}/epoch-{str(N_EPOCHS).zfill(2)}.pt")
+    except TrainingInterrupt as ti:
+        torch.save(ti.model.state_dict(), f"oxfordiiit-{layers}/epoch-{str(ti.epochs + 1).zfill(2)}.pt")
+        torch.save(ti.optimizer.state_dict(), f"oxfordiiit-{layers}/optimizer.pt")
+        raise KeyboardInterrupt
 
-model.load_state_dict(torch.load("oxfordiiitpet.pt"))
+model.load_state_dict(torch.load(sorted(glob.glob(f"oxfordiiit-{layers}/epoch-*.pt"))[-1]))
 model.eval()
 model.to(DEVICE)
 lrp = IntegratedGradients(model)
 i = iter(valid_loader2)
-asd = next(i)
-asd = next(i)
-asd = next(i)
-count = 0
+
 method = "kmeans_concave"
 out_dir = "results_" + method + "/"
 if os.path.exists(out_dir):
     shutil.rmtree(out_dir)
 os.mkdir(out_dir)
 noise_tunnel = NoiseTunnel(lrp)
-for asd in i:
+limit = 500
+for count, asd in tqdm(enumerate(i), total=limit):
     inp, out_orig = asd
     norm = transforms.Normalize(
         mean=[0.485, 0.456, 0.406],
@@ -294,7 +337,9 @@ for asd in i:
     input_norm = norm(inp)
     input_norm = input_norm[0].unsqueeze(0).to(DEVICE)
     input_norm.requires_grad = True
-    out = torch.topk(model(input_norm), 1)[-1]
+    output = model(input_norm)
+    output = F.softmax(output, dim=1)
+    score, out = torch.topk(output, 1)
 
 
     # attribution = lrp.attribute(inp, target=out)
@@ -308,10 +353,10 @@ for asd in i:
 
 
     attributions_ig_nt = lrp.attribute(input_norm, target=out)
-    ma = torch.max(attributions_ig_nt)
-    mi = torch.min(attributions_ig_nt)
-    print(ma)
-    print(mi)
+    # ma = torch.max(attributions_ig_nt)
+    # mi = torch.min(attributions_ig_nt)
+    # print(ma)
+    # print(mi)
     original_image = np.transpose(inp.squeeze(0).cpu().detach().numpy(), (1, 2, 0))
     grads = np.transpose(attributions_ig_nt.squeeze(0).cpu().detach().numpy(), (1, 2, 0))
     norm_img = _normalize_image_attr(grads, "positive", 2)
@@ -376,17 +421,23 @@ for asd in i:
 
     # cv2.imwrite(str(count+1).zfill(3) +"-org.png", highlight)
     # cv2.imwrite(str(count+1).zfill(3) +"-org2.png", orig_img)
-    im_h = np.hstack([orig_img, heatmap_img, highlight])
+    im_h = np.hstack(
+        [cv2.resize(orig_img, [orig_img.shape[1] // 2, orig_img.shape[0] // 2], interpolation=cv2.INTER_AREA),
+         cv2.resize(heatmap_img, [heatmap_img.shape[1] // 2, heatmap_img.shape[0] // 2], interpolation=cv2.INTER_AREA)])
+
+    im_v = np.vstack([im_h, highlight])
     # cv2.imwrite(str(count+1).zfill(3) +"-org2.png", orig_img)
     tuo = out.item()
-    cv2.imwrite(out_dir + str(count + 1).zfill(3) + "-instance-class-" + str(classes[tuo]) + "-"+str(classes[out_orig.item()])+".png", im_h)
-    cv2.imwrite(out_dir + str(count + 1).zfill(3) + "-instance-class-"  + str(classes[tuo]) + "-"+str(classes[out_orig.item()])+ "-norm_mask.png",
+    cv2.imwrite(out_dir + str(count + 1).zfill(3) + "-instance-class-" + str(classes[tuo]) + "-" + str(
+        classes[out_orig.item()]) + "-" + str(
+        round(score.squeeze().item(), 3)) + ".png", im_v)
+    cv2.imwrite(out_dir + str(count + 1).zfill(3) + "-instance-class-" + str(classes[tuo]) + "-" + str(
+        classes[out_orig.item()]) + "-norm_mask.png",
                 np.uint8(norm_img * 255))
     # _ = visualize_image_attr(grads, original_image, "blended_heat_map", sign="all", show_colorbar=True,
     #                          title="Overlayed Gradient Magnitudes: " + str(out))
     # _ = visualize_image_attr(None, np.uint8((original_image - 0.5) * mask + 0.5), method="original_image",
     #                          title="Original Image")
-    count += 1
-    if count == 500:
+    if count+1 == limit:
         break
 pass
