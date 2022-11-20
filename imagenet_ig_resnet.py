@@ -1,16 +1,16 @@
 import glob
 
 import cv2
-import rasterio.features
 import torch
 import torch.nn.functional as F
 import tqdm
-
+from captum._utils.models.linear_model import SkLearnLinearRegression
 from PIL import Image
 
 import os
 import json
 import numpy as np
+from captum.attr._core.lime import get_exp_kernel_similarity_function, Lime
 from captum.attr._utils.visualization import _normalize_image_attr
 from matplotlib.colors import LinearSegmentedColormap
 
@@ -57,12 +57,31 @@ for imfile in tqdm.tqdm(images):
     output = F.softmax(output, dim=1)
     prediction_score, pred_label_idx = torch.topk(output, 1)
 
-    pred_label_idx.squeeze_()
-    predicted_label = idx_to_labels[str(pred_label_idx.item())][1]
+    predicted_label = idx_to_labels[str(pred_label_idx[0].item())][1]
     # print('Predicted:', predicted_label, '(', prediction_score.squeeze().item(), ')')
     #
     # print('Predicted:', predicted_label, '(', prediction_score.squeeze().item(), ')')
+    exp_eucl_distance = get_exp_kernel_similarity_function('euclidean', kernel_width=1000)
 
+    lr_lime = Lime(
+        model,
+        interpretable_model=SkLearnLinearRegression(),  # build-in wrapped sklearn Linear Regression
+        similarity_func=exp_eucl_distance
+    )
+
+    attrs = lr_lime.attribute(input,
+        target=pred_label_idx,
+        n_samples=1000,
+        perturbations_per_eval=16,
+        show_progress=True
+    ).squeeze(0)
+
+    _ = viz.visualize_image_attr_multiple(np.transpose(attrs.cpu().detach().numpy(), (1, 2, 0)),
+                                          np.transpose(transformed_img.squeeze().cpu().detach().numpy(), (1, 2, 0)),
+                                          ["original_image", "blended_heat_map"],
+                                          ["all", "all"],
+                                          show_colorbar=True)
+    continue
     integrated_gradients = IntegratedGradients(model)
     # attributions_ig = integrated_gradients.attribute(input, target=pred_label_idx, n_steps=200)
     default_cmap = LinearSegmentedColormap.from_list('custom blue',
