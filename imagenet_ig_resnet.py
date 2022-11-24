@@ -4,13 +4,14 @@ import cv2
 import torch
 import torch.nn.functional as F
 import tqdm
-from captum._utils.models.linear_model import SkLearnLinearRegression
+from captum._utils.models import SkLearnLinearRegression
+from captum._utils.models.linear_model import SkLearnLinearModel
 from PIL import Image
 
 import os
 import json
 import numpy as np
-from captum.attr._core.lime import get_exp_kernel_similarity_function, Lime
+from captum.attr._core.lime import get_exp_kernel_similarity_function, Lime, LimeBase
 from captum.attr._utils.visualization import _normalize_image_attr
 from matplotlib.colors import LinearSegmentedColormap
 
@@ -39,11 +40,39 @@ transform = transforms.Compose([
     transforms.CenterCrop(224),
     transforms.ToTensor()
 ])
+def similarity_kernel(
+    original_input,
+    perturbed_input,
+    perturbed_interpretable_input,
+    **kwargs):
+        # kernel_width will be provided to attribute as a kwarg
+        kernel_width = kwargs["kernel_width"]
+        l2_dist = torch.norm(original_input - perturbed_input)
+        return torch.exp(- (l2_dist**2) / (kernel_width**2))
+
+
+# Define sampling function
+# This function samples in original input space
+def perturb_func(original_input,
+    **kwargs):
+        return original_input + torch.randn_like(original_input)
+
+# For this example, we are setting the interpretable input to
+# match the model input, so the to_interp_rep_transform
+# function simply returns the input. In most cases, the interpretable
+# input will be different and may have a smaller feature set, so
+# an appropriate transformation function should be provided.
+
+def to_interp_transform(curr_sample, original_inp,
+                                     **kwargs):
+    return curr_sample
 
 transform_normalize = transforms.Normalize(
     mean=[0.485, 0.456, 0.406],
     std=[0.229, 0.224, 0.225]
 )
+
+lime_attr = Lime(model)
 images = glob.glob("imagenet-sample-images-master/*")
 for imfile in tqdm.tqdm(images):
     img = Image.open(imfile)
@@ -61,24 +90,15 @@ for imfile in tqdm.tqdm(images):
     # print('Predicted:', predicted_label, '(', prediction_score.squeeze().item(), ')')
     #
     # print('Predicted:', predicted_label, '(', prediction_score.squeeze().item(), ')')
-    exp_eucl_distance = get_exp_kernel_similarity_function('euclidean', kernel_width=1000)
 
-    lr_lime = Lime(
-        model,
-        interpretable_model=SkLearnLinearRegression(),  # build-in wrapped sklearn Linear Regression
-        similarity_func=exp_eucl_distance
-    )
 
-    attrs = lr_lime.attribute(input,
-        target=pred_label_idx,
-        n_samples=1000,
-        perturbations_per_eval=16,
-        show_progress=True
-    ).squeeze(0)
 
+    attrs = lime_attr.attribute(input,
+        target=pred_label_idx).squeeze(0)
+    print(attrs.min().item(), attrs.max().item())
     _ = viz.visualize_image_attr_multiple(np.transpose(attrs.cpu().detach().numpy(), (1, 2, 0)),
                                           np.transpose(transformed_img.squeeze().cpu().detach().numpy(), (1, 2, 0)),
-                                          ["original_image", "blended_heat_map"],
+                                          ["original_image", "heat_map"],
                                           ["all", "all"],
                                           show_colorbar=True)
     continue
