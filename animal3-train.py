@@ -29,8 +29,10 @@ N_EPOCHS = 20
 IMG_SIZE = 32
 N_CLASSES = 10
 
-lambda_corr=float(sys.argv[1])
+lambda_corr = float(sys.argv[1])
 print(lambda_corr)
+
+
 def get_accuracy(model, data_loader, device):
     '''
     Function for computing the accuracy of the predictions over the entire data_loader
@@ -77,6 +79,7 @@ def plot_losses(train_losses, valid_losses):
 
     # change the plot style to default
     plt.style.use('default')
+    plt.close(fig)
 
 
 def training_loop(model, criterion, optimizer, train_loader, valid_loader, epochs, device, dir_out, print_every=1):
@@ -117,8 +120,6 @@ def training_loop(model, criterion, optimizer, train_loader, valid_loader, epoch
     return model, optimizer, (train_losses, valid_losses)
 
 
-
-
 class FeatureExtract(nn.Module):
     def __init__(self, pretrained=True):
         super().__init__()
@@ -135,6 +136,7 @@ class FeatureExtract(nn.Module):
         self.layer_nlm = nn.Conv2d(512, 32, kernel_size=1, stride=1, padding=0, bias=False)
 
         self.gap = nn.AdaptiveAvgPool2d(1)
+
     def forward(self, x):
         x = self.conv1(x)
         x = self.bn1(x)
@@ -156,12 +158,15 @@ class Classifier(nn.Module):
     def __init__(self, classes):
         super().__init__()
         self.linear = nn.Linear(32, classes)
+
     def forward(self, x):
         x = self.linear(x)
 
         return x
 
-    print(lambda_corr)
+print(lambda_corr)
+
+
 def correlationloss(output):
     output = output.cpu()
     batch, dim = output.shape
@@ -171,8 +176,9 @@ def correlationloss(output):
     corr_mat_1 = output - mean_of_batch * ones_vector
     corr_mat_2 = torch.transpose(corr_mat_1, 0, 1)
     corr_mat = torch.matmul(corr_mat_2, corr_mat_1)
-    loss = (1/(dim**2))*torch.sum(torch.abs(corr_mat))
+    loss = (1 / (dim ** 2)) * torch.sum(torch.abs(corr_mat))
     return loss
+
 
 def train(train_loader, model, criterion, optimizer, device):
     '''
@@ -195,7 +201,7 @@ def train(train_loader, model, criterion, optimizer, device):
         fe = model.fe(X)
         y_hat = model.cl(fe)
         loss = criterion(y_hat, y_true)
-        loss += lambda_corr*correlationloss(fe)
+        loss += lambda_corr * correlationloss(fe)
         running_loss += loss.item() * X.size(0)
         _, predicted_labels = torch.max(y_hat, 1)
 
@@ -229,7 +235,7 @@ def validate(valid_loader, model, criterion, device):
         fe = model.fe(X)
         y_hat = model.cl(fe)
         loss = criterion(y_hat, y_true)
-        loss += lambda_corr*correlationloss(fe)
+        loss += lambda_corr * correlationloss(fe)
         running_loss += loss.item() * X.size(0)
         _, predicted_labels = torch.max(y_hat, 1)
 
@@ -289,13 +295,13 @@ transform = transforms.Compose(
 transform_for_tensor = transforms.Compose(
     [transforms.Resize(size=(224, 224)),
      transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
-a10_train = Animal10("./data/animals-10/train",
+a10_train = Animal10("./data/animals-3/train",
                      transform=transform)
 
-a10_val = Animal10("./data/animals-10/test",
+a10_val = Animal10("./data/animals-3/test",
                    transform=transform)
 
-a10_val_wo_transform = Animal10("./data/animals-10/test",
+a10_val_wo_transform = Animal10("./data/animals-3/test",
                                 transform=transforms.Compose(
                                     [transforms.ToTensor()]))
 sample_0 = a10_train[0]
@@ -318,7 +324,7 @@ valid_loader = DataLoader(a10_val, batch_size=128,
 
 torch.manual_seed(RANDOM_SEED)
 torch.cuda.manual_seed(RANDOM_SEED)
-out_dir = f"animal10/resnet18-{lambda_corr}/"
+out_dir = f"animal3/resnet18-{lambda_corr}/"
 if not os.path.exists(out_dir):
     os.makedirs(out_dir)
 model = WholeModel(len(a10_train.classes))
@@ -358,12 +364,14 @@ def batch_predict(images):
 
     logits = model.fe(batch)
     return logits.detach().cpu().numpy()
-def visualize_weights(W, feature_idx, class_names, show = False):
-    max_abs_W = np.max(np.abs(W)) + 0.1 # For plotting
+
+
+def visualize_weights(W, feature_idx, class_names, show=False):
+    max_abs_W = np.max(np.abs(W)) + 0.1  # For plotting
     fig, ax = plt.subplots()
     fig.set_size_inches(9, 2)
     W = W.T
-    ax.barh(class_names, W[feature_idx], color = ['green' if w >= 0 else 'red' for w in W[feature_idx]])
+    ax.barh(class_names, W[feature_idx], color=['green' if w >= 0 else 'red' for w in W[feature_idx]])
     ax.set_xlim((-max_abs_W, max_abs_W))
     ax.set_yticks(range(len(class_names)))
     ax.set_yticklabels(class_names)
@@ -373,35 +381,36 @@ def visualize_weights(W, feature_idx, class_names, show = False):
     ax.set_title(f'Feature {feature_idx}')
     for i, v in enumerate(W[feature_idx]):
         if v >= 0:
-            ax.text(v + 0.01, i + .05, '%.4f'%(v), color='black')
+            ax.text(v + 0.01, i + .05, '%.4f' % (v), color='black')
         else:
-            ax.text(v - 0.13, i + .05, '%.4f'%(v), color='black')
+            ax.text(v - 0.13, i + .05, '%.4f' % (v), color='black')
     if show:
         plt.show()
     return fig, ax
 
+
 explainer = lime_image.LimeImageExplainer()
 
 for i, row in enumerate(index_per_feat):
-    if not os.path.exists(f"results-{lambda_corr}/{i}/"):
-        os.makedirs(f"results-{lambda_corr}/{i}/")
+    if not os.path.exists(f"animal3-results/results-{lambda_corr}/{i}/"):
+        os.makedirs(f"animal3-results/results-{lambda_corr}/{i}/")
     start = time.time()
     weight = model.cl.linear.weight.cpu().detach().numpy()
     fig, ax = visualize_weights(weight, i, a10_val.classes)
-    fig.savefig(f"results-{lambda_corr}/{i}/weight_plot.png")
+    fig.savefig(f"animal3-results/results-{lambda_corr}/{i}/weight_plot.png")
     plt.close(fig)
-    class_inst ={}
+    class_inst = {}
     for col in row.tolist():
         f = a10_val_wo_transform.files[col]
         cname = os.path.dirname(f).split("/")[-1]
-        class_inst[cname] = class_inst.get(cname, 0)+1
+        class_inst[cname] = class_inst.get(cname, 0) + 1
     print(class_inst)
     D = class_inst
     plt.bar(range(len(D)), list(D.values()), align='center')
     plt.xticks(range(len(D)), list(D.keys()))
-    plt.savefig(f"results-{lambda_corr}/{i}/most_activated.png")
+    plt.savefig(f"animal3-results/results-{lambda_corr}/{i}/most_activated.png")
     plt.close()
-    continue
+    row = row[:12]
     for j, col in enumerate(row.tolist()):
         image, label = a10_val_wo_transform[col]
 
@@ -421,12 +430,12 @@ for i, row in enumerate(index_per_feat):
 
         image2 += np.uint8(np.ones_like(image2) * 127 * np.dstack([1 - mask for _ in range(3)]))
 
-        cv2.imwrite(f"results-{lambda_corr}/{i}/{j}-{col}.png",
+        cv2.imwrite(f"animal3-results/results-{lambda_corr}/{i}/{j}-{col}.png",
                     np.uint8(cv2.cvtColor(np.vstack([image2, image_org]), cv2.COLOR_RGB2BGR)))
         print(f"{lambda_corr}/{i}/{j}-{col}")
     end = time.time()
 
-    print("Feature-time:", end-start)
+    print("Feature-time:", end - start)
 
 # for i, row in enumerate(index_per_feat):
 #     images = []
