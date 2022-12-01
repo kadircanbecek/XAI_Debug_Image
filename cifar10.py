@@ -1,26 +1,20 @@
 import os.path
-import shutil
-
-import rasterio.features
-from shapely import geometry
-
-from concavehull_scipy import alpha_shape
-
-import cv2
-import numpy
-from captum.attr import LRP, NoiseTunnel, IntegratedGradients
-import numpy as np
+import sys
+import time
 from datetime import datetime
 
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from captum.attr._utils.visualization import visualize_image_attr, _normalize_image_attr
+from lime import lime_image
 from torch.utils.data import DataLoader
-
 from torchvision import datasets, transforms
+from tqdm import tqdm
 
-import matplotlib.pyplot as plt
+from utils.losses import correlationloss
+from utils.models import FeatureExtract
 
 # check device
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -28,11 +22,14 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 # parameters
 RANDOM_SEED = 42
 LEARNING_RATE = 0.001
-BATCH_SIZE = 32
+BATCH_SIZE = 256
 N_EPOCHS = 20
 
 IMG_SIZE = 32
 N_CLASSES = 10
+
+lambda_corr = float(sys.argv[1])
+print(lambda_corr)
 
 
 def train(train_loader, model, criterion, optimizer, device):
@@ -43,23 +40,35 @@ def train(train_loader, model, criterion, optimizer, device):
     model.train()
     running_loss = 0
 
-    for X, y_true in train_loader:
+    correct_pred = 0
+    n = 0
+
+    for i, (X, y_true) in tqdm(enumerate(train_loader), total=len(train_loader)):
         optimizer.zero_grad()
 
         X = X.to(device)
         y_true = y_true.to(device)
 
         # Forward pass
-        y_hat = model(X)
+        fe = model.fe(X)
+        y_hat = model.cl(fe)
         loss = criterion(y_hat, y_true)
+        loss += lambda_corr*correlationloss(fe)
+
         running_loss += loss.item() * X.size(0)
+        _, predicted_labels = torch.max(y_hat, 1)
+
+        n += y_true.size(0)
+        correct_pred += (predicted_labels == y_true).sum()
 
         # Backward pass
         loss.backward()
         optimizer.step()
 
+
     epoch_loss = running_loss / len(train_loader.dataset)
-    return model, optimizer, epoch_loss
+    accuracy = (correct_pred.float() / n).item()
+    return model, optimizer, epoch_loss, accuracy
 
 
 def validate(valid_loader, model, criterion, device):
@@ -70,18 +79,27 @@ def validate(valid_loader, model, criterion, device):
     model.eval()
     running_loss = 0
 
-    for X, y_true in valid_loader:
+    correct_pred = 0
+    n = 0
+    for i, (X, y_true) in tqdm(enumerate(valid_loader), total=len(valid_loader)):
         X = X.to(device)
         y_true = y_true.to(device)
 
         # Forward pass and record loss
-        y_hat = model(X)
+        fe = model.fe(X)
+        y_hat = model.cl(fe)
         loss = criterion(y_hat, y_true)
+        loss += lambda_corr*correlationloss(fe)
         running_loss += loss.item() * X.size(0)
+        _, predicted_labels = torch.max(y_hat, 1)
+
+        n += y_true.size(0)
+        correct_pred += (predicted_labels == y_true).sum()
 
     epoch_loss = running_loss / len(valid_loader.dataset)
+    accuracy = (correct_pred.float() / n).item()
 
-    return model, epoch_loss
+    return model, epoch_loss, accuracy
 
 
 def get_accuracy(model, data_loader, device):
@@ -107,7 +125,7 @@ def get_accuracy(model, data_loader, device):
     return correct_pred.float() / n
 
 
-def plot_losses(train_losses, valid_losses):
+def plot_losses(train_losses, valid_losses, train_accuracies, val_accuracies, saveloc):
     '''
     Function for plotting training and validation losses
     '''
@@ -126,13 +144,31 @@ def plot_losses(train_losses, valid_losses):
            xlabel='Epoch',
            ylabel='Loss')
     ax.legend()
-    fig.show()
-
+    fig.savefig(os.path.join(saveloc, "losses.png"))
     # change the plot style to default
     plt.style.use('default')
+    plt.close(fig)
+
+    plt.style.use('seaborn')
+
+    train_accuracies = np.array(train_accuracies)
+    val_accuracies = np.array(val_accuracies)
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+
+    ax.plot(train_accuracies, color='blue', label='Training loss')
+    ax.plot(val_accuracies, color='red', label='Validation loss')
+    ax.set(title="Loss over epochs",
+           xlabel='Epoch',
+           ylabel='Loss')
+    ax.legend()
+    fig.savefig(os.path.join(saveloc, "accs.png"))
+    # change the plot style to default
+    plt.style.use('default')
+    plt.close(fig)
 
 
-def training_loop(model, criterion, optimizer, train_loader, valid_loader, epochs, device, print_every=1):
+def training_loop(model, criterion, optimizer, train_loader, valid_loader, epochs, device, dir_out, print_every=1):
     '''
     Function defining the entire training loop
     '''
@@ -141,23 +177,27 @@ def training_loop(model, criterion, optimizer, train_loader, valid_loader, epoch
     best_loss = 1e10
     train_losses = []
     valid_losses = []
+    train_accs = []
+    valid_accs = []
 
     # Train model
     for epoch in range(0, epochs):
 
         # training
-        model, optimizer, train_loss = train(train_loader, model, criterion, optimizer, device)
+        model, optimizer, train_loss, train_acc = train(train_loader, model, criterion, optimizer, device)
         train_losses.append(train_loss)
+        train_accs.append(train_acc)
 
         # validation
         with torch.no_grad():
-            model, valid_loss = validate(valid_loader, model, criterion, device)
+            model, valid_loss, valid_acc = validate(valid_loader, model, criterion, device)
             valid_losses.append(valid_loss)
+            valid_accs.append(valid_acc)
+            if min(valid_losses) == valid_loss:
+                torch.save(model.state_dict(), os.path.join(dir_out, "best.pt"))
+                print("best validation so far")
 
         if epoch % print_every == (print_every - 1):
-            train_acc = get_accuracy(model, train_loader, device=device)
-            valid_acc = get_accuracy(model, valid_loader, device=device)
-
             print(f'{datetime.now().time().replace(microsecond=0)} --- '
                   f'Epoch: {epoch}\t'
                   f'Train loss: {train_loss:.4f}\t'
@@ -165,7 +205,7 @@ def training_loop(model, criterion, optimizer, train_loader, valid_loader, epoch
                   f'Train accuracy: {100 * train_acc:.2f}\t'
                   f'Valid accuracy: {100 * valid_acc:.2f}')
 
-    plot_losses(train_losses, valid_losses)
+    plot_losses(train_losses, valid_losses, train_accs, valid_accs, dir_out)
 
     return model, optimizer, (train_losses, valid_losses)
 
@@ -175,6 +215,10 @@ transform = transforms.Compose(
     [transforms.ToTensor(),
      transforms.Resize(size=(32, 32)),
      transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+transform_for_tensor = transforms.Compose(
+    [transforms.Resize(size=(32, 32)),
+     transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+transform_only_tensor = transforms.ToTensor()
 
 # download and create datasets
 train_dataset = datasets.CIFAR10(root='./data', train=True,
@@ -183,6 +227,9 @@ train_dataset = datasets.CIFAR10(root='./data', train=True,
 valid_dataset = datasets.CIFAR10(root='./data', train=False,
                                  download=True,
                                  transform=transform)
+valid_dataset_wo_transform = datasets.CIFAR10(root='./data', train=False,
+                                              download=True,
+                                              transform=transform_only_tensor)
 
 # define the data loaders
 train_loader = DataLoader(dataset=train_dataset,
@@ -200,150 +247,132 @@ classes = ('plane', 'car', 'bird', 'cat',
 class Net(nn.Module):
     def __init__(self):
         super(Net, self).__init__()
-        self.conv1 = nn.Conv2d(3, 6, 5)
-        self.pool1 = nn.MaxPool2d(2, 2)
-        self.pool2 = nn.MaxPool2d(2, 2)
-        self.conv2 = nn.Conv2d(6, 16, 5)
-        self.fc1 = nn.Linear(16 * 5 * 5, 120)
-        self.fc2 = nn.Linear(120, 84)
-        self.fc3 = nn.Linear(84, 10)
+        self.fe = FeatureExtract()
+        self.fc4 = nn.Linear(32, 10)
         self.relu1 = nn.ReLU()
         self.relu2 = nn.ReLU()
         self.relu3 = nn.ReLU()
         self.relu4 = nn.ReLU()
+        self.relu5 = nn.ReLU()
+
+    def feature_extract(self, x):
+        x = self.fe(x)
+        return x
 
     def forward(self, x):
-        x = self.pool1(self.relu1(self.conv1(x)))
-        x = self.pool2(self.relu2(self.conv2(x)))
-        x = x.view(-1, 16 * 5 * 5)
-        x = self.relu3(self.fc1(x))
-        x = self.relu4(self.fc2(x))
-        x = self.fc3(x)
+        x = self.feature_extract(x)
+        x = self.fc4(x)
         return x
 
 
+out_dir = f"cifar10/resnet18-{lambda_corr}/"
+if not os.path.exists(out_dir):
+    os.makedirs(out_dir)
 torch.manual_seed(RANDOM_SEED)
-if not os.path.exists("cifar10.pt"):
-    model = Net().to(DEVICE)
+model = Net().to(DEVICE)
+if not os.path.exists(os.path.join(out_dir, "last.pt")):
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
     criterion = nn.CrossEntropyLoss()
+    model, optimizer, _ = training_loop(model, criterion, optimizer, train_loader, valid_loader, N_EPOCHS, DEVICE,
+                                        out_dir)
+    torch.save(model.state_dict(), os.path.join(out_dir, "last.pt"))
+model.load_state_dict(torch.load(os.path.join(out_dir, "best.pt")))
+model.eval()
 
-    model, optimizer, _ = training_loop(model, criterion, optimizer, train_loader, valid_loader, N_EPOCHS, DEVICE)
-    torch.save(model.state_dict(), "cifar10.pt")
+for i, (X, y) in enumerate(valid_dataset):
+    X = X.to(DEVICE)
+    X = X.unsqueeze(0)
+    feats = model.feature_extract(X)
+    feats = feats.cpu().detach().numpy()
+    if i == 0:
+        feats_all = feats
+    else:
+        feats_all = np.concatenate([feats_all, feats], axis=0)
 
-modeltoeval = Net()
-modeltoeval.load_state_dict(torch.load("cifar10.pt"))
-modeltoeval.eval()
-modeltoeval.to(DEVICE)
-lrp = IntegratedGradients(modeltoeval)
-i = iter(train_loader)
-asd = next(i)
-asd = next(i)
-asd = next(i)
-count = 0
-method = "kmeans_concave"
-out_dir = "results_" + method + "/"
-if os.path.exists(out_dir):
-    shutil.rmtree(out_dir)
-os.mkdir(out_dir)
-noise_tunnel = NoiseTunnel(lrp)
-for asd in i:
-    inp, out = asd
-    inp = inp[0].unsqueeze(0).to(DEVICE)
-    inp.requires_grad = True
-    out = out[0].to(DEVICE)
+ind = np.argsort(-feats_all, axis=0)[:230]
+feats_max = feats_all[ind, np.arange(feats_all.shape[1])]
+index_per_feat = ind.T
 
 
-    # attribution = lrp.attribute(inp, target=out)
+def batch_predict(images):
+    model.eval()
+    batch = torch.stack(tuple(transform(i) for i in images), dim=0)
 
-    def get_circular_kernel(diameter):
-        mid = (diameter - 1) / 2
-        distances = np.indices((diameter, diameter)) - np.array([mid, mid])[:, None, None]
-        kernel = ((np.linalg.norm(distances, axis=0) - mid) <= 0).astype(int)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    batch = batch.to(device)
 
-        return kernel
+    logits = model.feature_extract(batch)
+    return logits.detach().cpu().numpy()
 
 
-    attributions_ig_nt = noise_tunnel.attribute(inp, nt_samples=10, nt_type='smoothgrad_sq', target=out)
-    ma = torch.max(attributions_ig_nt)
-    mi = torch.min(attributions_ig_nt)
-    print(ma)
-    print(mi)
-    original_image = np.transpose((inp.squeeze(0).cpu().detach().numpy() / 2) + 0.5, (1, 2, 0))
-    grads = np.transpose(attributions_ig_nt.squeeze(0).cpu().detach().numpy(), (1, 2, 0))
-    norm_img = _normalize_image_attr(grads, "positive", 2)
-    ngrads = norm_img
-    # if method == "brute":
-    #     nz = numpy.nonzero(ngrads > 0.2)
-    #     transpose = np.array(nz, dtype=np.float32).transpose()[:, 0:2]
-    #     hull = cv2.convexHull(transpose)
-    #     mask = np.zeros_like(grads)[..., 0:1]
-    #     mask = np.uint8(mask)
-    #     int_ = np.int32(hull)
-    #     cv2.fillPoly(mask, pts=[int_], color=(1, 1, 1))
-    # elif method.startswith("kmeans"):
-    #     premask = ngrads * 255
-    #     vectorized = np.float32(premask.reshape(-1, 1))
-    #     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
-    #
-    #     K = 2
-    #     attempts = 10
-    #     ret, label, center = cv2.kmeans(vectorized, K, None, criteria, attempts, cv2.KMEANS_PP_CENTERS)
-    #     res = center[label.flatten()]
-    #     res2 = res.reshape((original_image.shape))
-    #     mask = (res2 - np.min(res2)) / (np.max(res2) - np.min(res2))
-    #     if "concave" in method:
-    #         nz = numpy.nonzero(ngrads > (np.true_divide(ngrads.sum(), (ngrads != 0).sum())*2))
-    #         transpose = np.array(nz, dtype=np.float32).transpose()[:, 0:2]
-    #         point_collection = geometry.MultiPoint(list(transpose))
-    #
-    #         concave_hull, edge_points = alpha_shape(point_collection, alpha=0.4)
-    #         mask = rasterio.features.rasterize([concave_hull], out_shape=(32, 32)).transpose()
-    #     if len(mask.shape) < 3:
-    #         h, w, c = original_image.shape
-    #         mask = mask.reshape((h, w, -1))
-    #         if mask.shape[2] != c:
-    #             mask = np.dstack((mask,) * c)
+def visualize_weights(W, feature_idx, class_names, show=False):
+    max_abs_W = np.max(np.abs(W)) + 0.1  # For plotting
+    fig, ax = plt.subplots()
+    fig.set_size_inches(9, 2)
+    W = W.T
+    ax.barh(class_names, W[feature_idx], color=['green' if w >= 0 else 'red' for w in W[feature_idx]])
+    ax.set_xlim((-max_abs_W, max_abs_W))
+    ax.set_yticks(range(len(class_names)))
+    ax.set_yticklabels(class_names)
+    ax.yaxis.tick_right()
+    ax.invert_yaxis()
+    ax.set_xlabel('Weights')
+    ax.set_title(f'Feature {feature_idx}')
+    for i, v in enumerate(W[feature_idx]):
+        if v >= 0:
+            ax.text(v + 0.01, i + .05, '%.4f' % (v), color='black')
+        else:
+            ax.text(v - 0.13, i + .05, '%.4f' % (v), color='black')
+    if show:
+        plt.show()
+    return fig, ax
 
-    # boundary_points = np.int32(np.vstack(ch.boundary.exterior.coords.xy).T)
-    # # boundary_points is a subset of pts corresponding to the concave hull
-    # mask = np.zeros_like(mask)
-    # cv2.fillPoly(mask, pts=[boundary_points], color=(1))
-    h, w, c = original_image.shape
 
-    kernel = np.uint8(get_circular_kernel(5))
-    mask = norm_img
-    mask[mask > 0.25] = 1
-    mask = cv2.dilate(mask, kernel)
+explainer = lime_image.LimeImageExplainer()
 
-    blur = cv2.GaussianBlur(mask * 255, (13, 13), 11)
-    blur = np.uint8(blur)
-    heatmap_img = cv2.applyColorMap(blur, cv2.COLORMAP_JET)
+for i, row in enumerate(index_per_feat):
+    if not os.path.exists(f"cifar-10-results/results-{lambda_corr}/{i}/"):
+        os.makedirs(f"cifar-10-results/results-{lambda_corr}/{i}/")
+    start = time.time()
+    weight = model.fc4.weight.cpu().detach().numpy()
+    fig, ax = visualize_weights(weight, i, valid_dataset.classes)
+    fig.savefig(f"cifar-10-results/results-{lambda_corr}/{i}/weight_plot.png")
+    plt.close(fig)
+    class_inst = {}
+    for col in row.tolist():
+        X, label = valid_dataset[col]
+        cname = valid_dataset.classes[label]
+        class_inst[cname] = class_inst.get(cname, 0) + 1
+    print(class_inst)
+    D = class_inst
+    plt.bar(range(len(D)), list(D.values()), align='center')
+    plt.xticks(range(len(D)), list(D.keys()))
+    plt.savefig(f"cifar-10-results/results-{lambda_corr}/{i}/most_activated.png")
+    plt.close()
+    row = row[:12]
+    for j, col in enumerate(row.tolist()):
+        image, label = valid_dataset_wo_transform[col]
 
-    if len(mask.shape) < 3:
-        mask = mask.reshape((h, w, -1))
-    if mask.shape[2] != c:
-        mask = np.dstack((mask,) * c)
-    mask = mask * 0.9 + 0.1
-    mask_gray = mask * 255
-    # cv2.imwrite(str(count+1).zfill(3) +"-mask.png", mask_gray)
-    orig_img = np.uint8((original_image) * 255)
-    orig_img = cv2.cvtColor(orig_img, cv2.COLOR_BGR2RGB)
-    highlight = cv2.addWeighted(heatmap_img, 0.5, orig_img, 0.5, 0)
+        image2 = np.uint8(image.numpy().transpose(1, 2, 0) * 255)
+        image_org = image2.copy()
+        image3 = cv2.resize(image2, (224, 224))
+        explanation = explainer.explain_instance(image3, batch_predict, (i,),
+                                                 top_labels=None,
+                                                 hide_color=0,
+                                                 num_samples=1000,
+                                                 batch_size=256,
+                                                 random_seed=RANDOM_SEED)
+        _, mask = explanation.get_image_and_mask(i)
+        h, w = image_org.shape[:2]
+        mask = np.float32(cv2.resize(np.float32(mask), (w, h)) > 0)
+        image2 = np.uint8(image2 * np.dstack([mask for _ in range(3)]))
 
-    # cv2.imwrite(str(count+1).zfill(3) +"-org.png", highlight)
-    # cv2.imwrite(str(count+1).zfill(3) +"-org2.png", orig_img)
-    im_h = np.hstack([orig_img, heatmap_img, highlight])
-    # cv2.imwrite(str(count+1).zfill(3) +"-org2.png", orig_img)
-    tuo = out.item()
-    cv2.imwrite(out_dir + str(count + 1).zfill(3) + "-instance-class-" + str(tuo) + ".png", im_h)
-    cv2.imwrite(out_dir + str(count + 1).zfill(3) + "-instance-class-" + str(tuo) + "norm_mask.png",
-                np.uint8(norm_img * 255))
-    # _ = visualize_image_attr(grads, original_image, "blended_heat_map", sign="all", show_colorbar=True,
-    #                          title="Overlayed Gradient Magnitudes: " + str(out))
-    # _ = visualize_image_attr(None, np.uint8((original_image - 0.5) * mask + 0.5), method="original_image",
-    #                          title="Original Image")
-    count += 1
-    if count == 500:
-        break
-pass
+        image2 += np.uint8(np.ones_like(image2) * 127 * np.dstack([1 - mask for _ in range(3)]))
+
+        cv2.imwrite(f"cifar-10-results/results-{lambda_corr}/{i}/{j}-{col}.png",
+                    np.uint8(cv2.cvtColor(np.vstack([image2, image_org]), cv2.COLOR_RGB2BGR)))
+        print(f"{lambda_corr}/{i}/{j}-{col}")
+    end = time.time()
+
+    print("Feature-time:", end - start)
