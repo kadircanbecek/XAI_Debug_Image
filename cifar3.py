@@ -2,11 +2,11 @@ import os.path
 import sys
 import time
 from datetime import datetime
+from typing import Optional, Callable
 
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 from lime import lime_image
@@ -16,6 +16,8 @@ from tqdm import tqdm
 
 from utils.losses import correlationloss
 from utils.models import FeatureExtract, WholeModel
+import pandas as pd
+
 from utils.utils import plot_confusion_matrix
 
 # check device
@@ -211,6 +213,22 @@ def training_loop(model, criterion, optimizer, train_loader, valid_loader, epoch
     return model, optimizer, (train_losses, valid_losses)
 
 
+class CIFAR3(datasets.CIFAR10):
+    def __init__(self, root: str,
+                 train: bool = True,
+                 transform: Optional[Callable] = None,
+                 target_transform: Optional[Callable] = None,
+                 download: bool = False, ):
+        super().__init__(root, train, transform, target_transform, download)
+        self.idx_to_class = {v: k for k, v in self.class_to_idx.items()}
+        self.class_to_idx = {'automobile': 0, 'cat': 1, 'ship': 2}
+        self.classes_old = [cl for cl in self.classes]
+        self.classes = ['automobile', 'cat', 'ship']
+        data_to_keep = [i for i, target in enumerate(self.targets) if self.idx_to_class[target] in self.classes]
+        self.targets = [self.class_to_idx[self.idx_to_class[self.targets[i]]] for i in data_to_keep]
+        self.data = self.data[data_to_keep]
+
+
 # define transforms
 transform = transforms.Compose(
     [transforms.ToTensor(),
@@ -222,16 +240,17 @@ transform_for_tensor = transforms.Compose(
 transform_only_tensor = transforms.ToTensor()
 
 # download and create datasets
-train_dataset = datasets.CIFAR10(root='./data', train=True,
-                                 download=True, transform=transform)
+train_dataset = CIFAR3(root='./data', train=True,
+                       download=True, transform=transform)
 
-valid_dataset = datasets.CIFAR10(root='./data', train=False,
-                                 download=True,
-                                 transform=transform)
-valid_dataset_wo_transform = datasets.CIFAR10(root='./data', train=False,
-                                              download=True,
-                                              transform=transform_only_tensor)
-
+valid_dataset = CIFAR3(root='./data', train=False,
+                       download=True,
+                       transform=transform)
+valid_dataset_wo_transform = CIFAR3(root='./data', train=False,
+                                    download=True,
+                                    transform=transform_only_tensor)
+print(train_dataset.classes)
+print(train_dataset.class_to_idx)
 # define the data loaders
 train_loader = DataLoader(dataset=train_dataset,
                           batch_size=BATCH_SIZE,
@@ -266,7 +285,7 @@ class Net(nn.Module):
         return x
 
 
-out_dir = f"cifar10/resnet18-{lambda_corr}/"
+out_dir = f"cifar3/resnet18-{lambda_corr}/"
 if not os.path.exists(out_dir):
     os.makedirs(out_dir)
 torch.manual_seed(RANDOM_SEED)
@@ -334,12 +353,12 @@ def visualize_weights(W, feature_idx, class_names, show=False):
 explainer = lime_image.LimeImageExplainer()
 
 for i, row in enumerate(index_per_feat):
-    if not os.path.exists(f"cifar10-results/results-{lambda_corr}/{i}/"):
-        os.makedirs(f"cifar10-results/results-{lambda_corr}/{i}/")
+    if not os.path.exists(f"cifar3-results/results-{lambda_corr}/{i}/"):
+        os.makedirs(f"cifar3-results/results-{lambda_corr}/{i}/")
     start = time.time()
     weight = model.cl.linear.weight.cpu().detach().numpy()
     fig, ax = visualize_weights(weight, i, valid_dataset.classes)
-    fig.savefig(f"cifar10-results/results-{lambda_corr}/{i}/weight_plot.png")
+    fig.savefig(f"cifar3-results/results-{lambda_corr}/{i}/weight_plot.png")
     plt.close(fig)
     class_inst = np.zeros((len(valid_dataset.classes), len(valid_dataset.classes)))
     # class_inst = []
@@ -350,8 +369,22 @@ for i, row in enumerate(index_per_feat):
         idx = int(torch.argmax(out, dim=1).squeeze().cpu().item())
         class_inst[label, idx] = class_inst[label, idx] + 1
     fig, ax = plot_confusion_matrix(class_inst, valid_dataset.classes)
-    fig.savefig(f"cifar10-results/results-{lambda_corr}/{i}/conf-mat.png")
+    fig.savefig(f"cifar3-results/results-{lambda_corr}/{i}/conf-mat.png")
     plt.close(fig)
+
+    # print(class_inst)
+    # D = class_inst
+    # plt.bar(range(len(D)), list(D.values()), align='center')
+    # plt.xticks(range(len(D)), list(D.keys()))
+    # plt.savefig(f"cifar3-results/results-{lambda_corr}/{i}/most_activated.png")
+    # plt.close()
+    # print(class_inst_pred)
+    #
+    # D = class_inst_pred
+    # plt.bar(range(len(D)), list(D.values()), align='center')
+    # plt.xticks(range(len(D)), list(D.keys()))
+    # plt.savefig(f"cifar3-results/results-{lambda_corr}/{i}/most_activated_pred.png")
+    # plt.close()
     row = row[:12]
     for j, col in enumerate(row.tolist()):
         image, label = valid_dataset_wo_transform[col]
@@ -372,7 +405,7 @@ for i, row in enumerate(index_per_feat):
 
         image2 += np.uint8(np.ones_like(image2) * 127 * np.dstack([1 - mask for _ in range(3)]))
 
-        cv2.imwrite(f"cifar10-results/results-{lambda_corr}/{i}/{j}-{col}.png",
+        cv2.imwrite(f"cifar3-results/results-{lambda_corr}/{i}/{j}-{col}.png",
                     np.uint8(cv2.cvtColor(np.vstack([image2, image_org]), cv2.COLOR_RGB2BGR)))
         print(f"{lambda_corr}/{i}/{j}-{col}")
     end = time.time()

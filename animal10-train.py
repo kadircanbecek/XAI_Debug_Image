@@ -18,6 +18,8 @@ from torchvision.models import resnet18
 from tqdm import tqdm
 from lime import lime_image
 
+from utils.utils import plot_confusion_matrix
+
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # parameters
@@ -73,10 +75,10 @@ def plot_losses(train_losses, valid_losses):
            xlabel='Epoch',
            ylabel='Loss')
     ax.legend()
-    fig.show()
 
     # change the plot style to default
     plt.style.use('default')
+    plt.close(fig)
 
 
 def training_loop(model, criterion, optimizer, train_loader, valid_loader, epochs, device, dir_out, print_every=1):
@@ -344,9 +346,18 @@ for i, (X, y) in enumerate(a10_val):
     else:
         feats_all = np.concatenate([feats_all, feats], axis=0)
 
-ind = np.argsort(-feats_all, axis=0)[:230]
+
+ind = np.argsort(-feats_all, axis=0)
 feats_max = feats_all[ind, np.arange(feats_all.shape[1])]
 index_per_feat = ind.T
+index_per_feat_only_pos = []
+for i, row in enumerate(index_per_feat):
+    # print(row)
+    index_per_feat_only_pos_row = []
+    for c in row:
+        if feats_all[c, i] > 0:
+            index_per_feat_only_pos_row.append(c)
+    index_per_feat_only_pos.append(index_per_feat_only_pos_row)
 
 
 def batch_predict(images):
@@ -358,12 +369,14 @@ def batch_predict(images):
 
     logits = model.fe(batch)
     return logits.detach().cpu().numpy()
-def visualize_weights(W, feature_idx, class_names, show = False):
-    max_abs_W = np.max(np.abs(W)) + 0.1 # For plotting
+
+
+def visualize_weights(W, feature_idx, class_names, show=False):
+    max_abs_W = np.max(np.abs(W)) + 0.1  # For plotting
     fig, ax = plt.subplots()
     fig.set_size_inches(9, 2)
     W = W.T
-    ax.barh(class_names, W[feature_idx], color = ['green' if w >= 0 else 'red' for w in W[feature_idx]])
+    ax.barh(class_names, W[feature_idx], color=['green' if w >= 0 else 'red' for w in W[feature_idx]])
     ax.set_xlim((-max_abs_W, max_abs_W))
     ax.set_yticks(range(len(class_names)))
     ax.set_yticklabels(class_names)
@@ -373,41 +386,49 @@ def visualize_weights(W, feature_idx, class_names, show = False):
     ax.set_title(f'Feature {feature_idx}')
     for i, v in enumerate(W[feature_idx]):
         if v >= 0:
-            ax.text(v + 0.01, i + .05, '%.4f'%(v), color='black')
+            ax.text(v + 0.01, i + .05, '%.4f' % (v), color='black')
         else:
-            ax.text(v - 0.13, i + .05, '%.4f'%(v), color='black')
+            ax.text(v - 0.13, i + .05, '%.4f' % (v), color='black')
     if show:
         plt.show()
     return fig, ax
 
+
 explainer = lime_image.LimeImageExplainer()
 
-for i, row in enumerate(index_per_feat):
-    if not os.path.exists(f"results-{lambda_corr}/{i}/"):
-        os.makedirs(f"results-{lambda_corr}/{i}/")
+for i, row in enumerate(index_per_feat_only_pos):
+    if not os.path.exists(f"animal10-results/results-{lambda_corr}/{i}/"):
+        os.makedirs(f"animal10-results/results-{lambda_corr}/{i}/")
     start = time.time()
     weight = model.cl.linear.weight.cpu().detach().numpy()
     fig, ax = visualize_weights(weight, i, a10_val.classes)
-    fig.savefig(f"results-{lambda_corr}/{i}/weight_plot.png")
+    fig.savefig(f"animal10-results/results-{lambda_corr}/{i}/weight_plot.png")
     plt.close(fig)
-    class_inst ={}
-    for col in row.tolist():
-        f = a10_val_wo_transform.files[col]
-        cname = os.path.dirname(f).split("/")[-1]
-        class_inst[cname] = class_inst.get(cname, 0)+1
-    print(class_inst)
-    D = class_inst
-    plt.bar(range(len(D)), list(D.values()), align='center')
-    plt.xticks(range(len(D)), list(D.keys()))
-    plt.savefig(f"results-{lambda_corr}/{i}/most_activated.png")
-    plt.close()
-    continue
-    for j, col in enumerate(row.tolist()):
+    class_inst = np.zeros((len(a10_val.classes), len(a10_val.classes)))
+    # class_inst = []
+    # class_inst_pred = []
+    for col in row:
+        X, label = a10_val[col]
+        out = model(X.unsqueeze(0).to(DEVICE))
+        idx = int(torch.argmax(out, dim=1).squeeze().cpu().item())
+        class_inst[label, idx] = class_inst[label, idx] + 1
+    fig, ax = plot_confusion_matrix(class_inst, a10_val.classes)
+    fig.savefig(f"animal10-results/results-{lambda_corr}/{i}/conf-mat.png")
+    plt.close(fig)
+    row_to_select = np.array(row)
+    fmax = feats_max.T[i, :len(row_to_select)]
+    row = np.random.choice(row_to_select, 45, p=(fmax / np.sum(fmax)), replace=False)
+    fmax = feats_max[:, i]
+    inds = np.argsort(-fmax[row])
+    row = row[inds]
+
+    for j, col in enumerate(row):
         image, label = a10_val_wo_transform[col]
 
         image2 = np.uint8(image.numpy().transpose(1, 2, 0) * 255)
         image_org = image2.copy()
-        image3 = cv2.resize(image2, (224, 224))
+        wh = (224, 224)
+        image3 = cv2.resize(image2, wh)
         explanation = explainer.explain_instance(image3, batch_predict, (i,),
                                                  top_labels=None,
                                                  hide_color=0,
@@ -415,19 +436,19 @@ for i, row in enumerate(index_per_feat):
                                                  batch_size=256,
                                                  random_seed=RANDOM_SEED)
         _, mask = explanation.get_image_and_mask(i)
-        h, w = image_org.shape[:2]
-        mask = np.float32(cv2.resize(np.float32(mask), (w, h)) > 0)
+        h, w = image3.shape[:2]
+        mask = np.float32(np.float32(mask) > 0)
+        image2 = cv2.resize(image2, wh)
         image2 = np.uint8(image2 * np.dstack([mask for _ in range(3)]))
 
         image2 += np.uint8(np.ones_like(image2) * 127 * np.dstack([1 - mask for _ in range(3)]))
 
-        cv2.imwrite(f"results-{lambda_corr}/{i}/{j}-{col}.png",
-                    np.uint8(cv2.cvtColor(np.vstack([image2, image_org]), cv2.COLOR_RGB2BGR)))
+        cv2.imwrite(f"animal10-results/results-{lambda_corr}/{i}/{j}-{col}.png",
+                    np.uint8(cv2.cvtColor(np.vstack([image2, image3]), cv2.COLOR_RGB2BGR)))
         print(f"{lambda_corr}/{i}/{j}-{col}")
     end = time.time()
 
-    print("Feature-time:", end-start)
-
+    print("Feature-time:", end - start)
 # for i, row in enumerate(index_per_feat):
 #     images = []
 #     for j, col in enumerate(row):

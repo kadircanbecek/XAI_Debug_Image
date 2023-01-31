@@ -57,7 +57,7 @@ class Classifier(nn.Module):
 class WholeModel(nn.Module):
     def __init__(self, classes, pretrained=True):
         super().__init__()
-        self.fe = FeatureExtract(pretrained)
+        self.fe = FeatureExtract(pretrained=pretrained)
         self.cl = Classifier(classes)
 
     def forward(self, x):

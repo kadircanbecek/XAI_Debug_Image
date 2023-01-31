@@ -3,7 +3,7 @@ import os.path
 import random
 import shutil
 
-datas = glob.glob("data/animals-5/raw-img/*")
+datas = glob.glob("data/animals-3/raw-img/*")
 for data in datas:
     all_data = list(glob.glob(os.path.join(data, "*.png")))
     length = len(all_data)

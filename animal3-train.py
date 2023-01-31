@@ -4,6 +4,7 @@ import sys
 import time
 from collections import OrderedDict
 from datetime import datetime
+from itertools import combinations
 
 import cv2
 import numpy as np
@@ -18,13 +19,15 @@ from torchvision.models import resnet18
 from tqdm import tqdm
 from lime import lime_image
 
+from utils.utils import plot_confusion_matrix
+
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # parameters
 RANDOM_SEED = 42
 LEARNING_RATE = 0.001
 BATCH_SIZE = 32
-N_EPOCHS = 20
+N_EPOCHS = 90
 
 IMG_SIZE = 32
 N_CLASSES = 10
@@ -75,7 +78,6 @@ def plot_losses(train_losses, valid_losses):
            xlabel='Epoch',
            ylabel='Loss')
     ax.legend()
-    fig.show()
 
     # change the plot style to default
     plt.style.use('default')
@@ -163,6 +165,7 @@ class Classifier(nn.Module):
         x = self.linear(x)
 
         return x
+
 
 print(lambda_corr)
 
@@ -295,13 +298,13 @@ transform = transforms.Compose(
 transform_for_tensor = transforms.Compose(
     [transforms.Resize(size=(224, 224)),
      transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
-a10_train = Animal10("./data/animals-3/train",
+a10_train = Animal10("./data/animals-3/backup/train",
                      transform=transform)
 
-a10_val = Animal10("./data/animals-3/test",
+a10_val = Animal10("./data/animals-3/backup/test",
                    transform=transform)
 
-a10_val_wo_transform = Animal10("./data/animals-3/test",
+a10_val_wo_transform = Animal10("./data/animals-3/backup/test",
                                 transform=transforms.Compose(
                                     [transforms.ToTensor()]))
 sample_0 = a10_train[0]
@@ -324,10 +327,10 @@ valid_loader = DataLoader(a10_val, batch_size=128,
 
 torch.manual_seed(RANDOM_SEED)
 torch.cuda.manual_seed(RANDOM_SEED)
-out_dir = f"animal3/resnet18-{lambda_corr}/"
+out_dir = f"animal3-backup/resnet18-{lambda_corr}/"
 if not os.path.exists(out_dir):
     os.makedirs(out_dir)
-model = WholeModel(len(a10_train.classes))
+model = WholeModel(len(a10_train.classes), pretrained=False)
 model.to(DEVICE)
 
 if not os.path.exists(os.path.join(out_dir, "last.pt")):
@@ -337,9 +340,379 @@ if not os.path.exists(os.path.join(out_dir, "last.pt")):
     model, optimizer, _ = training_loop(model, criterion, optimizer, train_loader, valid_loader, N_EPOCHS, DEVICE,
                                         out_dir)
     torch.save(model.state_dict(), os.path.join(out_dir, "last.pt"))
+    exit()
 model.load_state_dict(torch.load(os.path.join(out_dir, "best.pt")))
 model.eval()
+non_point_ = [10, 18, 19, 23, 30]
+cats_lp = [4, 8, 15, 17, 13, 22, 2, 14, 9]
+cats_mp = [20, 29, 1, 16, 24, 5, 12, 21, 11]
+cats_hp = [6, 7, 26, 27, 28, 31, 3, 25, 0]
+cows_lp = [15, 20, 22, 24, 29, 0, 8, 17, 21]
+cows_mp = [13, 14, 25, 3, 6, 7, 2, 5, 1]
+cows_hp = [12, 28, 31, 11, 9, 27, 26, 4, 16]
+spiders_lp = [16, 26, 3, 27, 0, 25, 28, 31, 11]
+spiders_mp = [4, 7, 6, 12, 21, 5, 9, 1, 2]
+spiders_hp = [14, 13, 24, 20, 29, 8, 17, 22, 15]
+bias = model.cl.linear.bias.cpu().detach().numpy()
+print("bias", bias)
 
+ll = [l for l in cats_lp if l in cows_lp and l in spiders_lp]
+
+print(ll)
+
+
+def disable_weight(weight, disabled_feats, classes=None):
+    disable_mat = torch.ones_like(weight)
+    if classes is None:
+        disable_mat[:, disabled_feats] = 0
+    else:
+        disable_mat[classes, disabled_feats] = 0
+    weight = weight * disable_mat
+    return weight
+
+
+# co = sorted(cats_hp)
+# model.load_state_dict(torch.load(os.path.join(out_dir, "best.pt")))
+# 
+# model.cl.linear.weight = torch.nn.Parameter(disable_weight(model.cl.linear.weight, co))
+# print(model.cl.linear.weight.detach().cpu().numpy())
+# preds = []
+# class_inst = np.zeros((3, 3))
+# 
+# for i, (X, y) in enumerate(a10_val):
+#     X = X.to(DEVICE)
+#     X = X.unsqueeze(0)
+#     outs = model(X)
+#     _, predicted_labels = torch.max(outs, 1)
+#     cla = predicted_labels.item()
+#     if cla + y == 0:
+#         pass
+#     label = y
+#     preds.append(cla)
+#     class_inst[label, cla] = class_inst[label, cla] + 1
+# fig, ax = plot_confusion_matrix(class_inst, a10_val.classes)
+# fig.savefig(f"animal3-results-backup/results-{lambda_corr}/conf-mat-cat-wo-hp-cat-feature.png")
+# plt.close(fig)
+# exit()
+cattoes = [("cat", [("lp", cats_lp), ("mp", cats_mp), ("hp", cats_hp)]),
+           ("cow", [("lp", cows_lp), ("mp", cows_mp), ("hp", cows_hp)]),
+           ("spider", [("lp", spiders_lp), ("mp", spiders_mp), ("hp", spiders_hp)]), ]
+
+
+class ScoreKeeperAll:
+    def __init__(self):
+        self.total_acc = 0
+        self.total_tp = 0
+        self.total_fp = 0
+        self.total_fn = 0
+        self.total_tn = 0
+        self.score_insts = []
+        self.macro_f1 = 0
+        self.micro_f1 = 0
+        self.weighted_f1 = 0
+        pass
+
+    def __str__(self):
+        text = ""
+        text += "Total Acc: "
+        text += str(round(self.total_acc, 3))
+        text += "\n"
+        text += "Macro F1: "
+        text += str(round(self.macro_f1, 3))
+        text += "\n"
+        text += "Micro F1: "
+        text += str(round(self.micro_f1, 3))
+        text += "\n"
+
+        for scoreskeep in self.score_insts:
+            text += str(scoreskeep)
+            text += "\n"
+
+        return text
+
+
+class ScoreKeeperInst:
+    def __init__(self, cname):
+        self.cname = cname
+        self.tp = 0
+        self.fp = 0
+        self.fn = 0
+        self.tn = 0
+        self.acc = 0
+        self.f1 = 0
+        pass
+
+    def __str__(self):
+        text = f"{self.cname}:\n"
+        text += f"Total Acc: "
+        text += str(round(self.acc, 3))
+        text += "\n"
+        text += "Macro F1: "
+        text += str(round(self.f1, 3))
+        text += "\n"
+        return text
+
+
+# cat1 = combinations([cats_lp, cats_mp, cats_hp], 1)
+def scores(class_inst):
+    scoreall = ScoreKeeperAll()
+    scoreall.total_acc = np.sum(np.diagonal(class_inst)) / np.sum(class_inst)
+
+    for i in range(len(class_inst)):
+        score_inst = ScoreKeeperInst(a10_val.classes[i])
+        score_inst.tp = tp = class_inst[i, i]
+        scoreall.total_tp += tp
+        score_inst.fp = fp = np.sum(class_inst[:, i]) - tp
+        scoreall.total_fp += fp
+        score_inst.fn = fn = np.sum(class_inst[i, :]) - tp
+        scoreall.total_fn += fn
+        score_inst.tn = tn = np.sum(class_inst) - fp - tp - fn
+        scoreall.total_tn += tn
+        score_inst.acc = accuracy = (tp + tn) / (tp + fp + fn + tn)
+        precision = tp / (tp + fp)
+        recall = tp / (tp + fn)
+        score_inst.f1 = 2 * precision * recall / (precision + recall)
+        scoreall.score_insts.append(score_inst)
+    f1s = [inst.f1 for inst in scoreall.score_insts]
+    scoreall.macro_f1 = sum(f1s) / len(f1s)
+    microprecision = scoreall.total_tp / (scoreall.total_tp + scoreall.total_fp)
+    microrecall = scoreall.total_tp / (scoreall.total_tp + scoreall.total_fn)
+    scoreall.micro_f1 = 2 * microprecision * microrecall / (microprecision + microrecall)
+
+    return scoreall
+
+
+cat_cos = [[cats_mp[0],cats_mp[1],cats_mp[2]],[cats_mp[3],cats_mp[4],cats_mp[5]],[cats_mp[6],cats_mp[7],cats_mp[8]]]
+for cat_co in cat_cos:
+    cat_co = sorted(list(cat_co))
+    model.load_state_dict(torch.load(os.path.join(out_dir, "best.pt")))
+
+    model.cl.linear.weight = torch.nn.Parameter(disable_weight(model.cl.linear.weight, cat_co, classes=[1]))
+    # print(model.cl.linear.weight.detach().cpu().numpy())
+    preds = []
+    class_inst = np.zeros((3, 3))
+
+    for i, (X, y) in enumerate(a10_val):
+        X = X.to(DEVICE)
+        X = X.unsqueeze(0)
+        outs = model(X)
+        _, predicted_labels = torch.max(outs, 1)
+        cla = predicted_labels.item()
+        label = y
+        preds.append(cla)
+        class_inst[label, cla] = class_inst[label, cla] + 1
+    fig, ax = plot_confusion_matrix(class_inst, a10_val.classes)
+    fig.savefig(
+        f"animal3-results-backup/results-{lambda_corr}/conf-mat-cat-wo-{cat_co[0]}-{cat_co[1]}-{cat_co[2]}-cat-feature.png")
+    plt.close(fig)
+
+    scorekeep = scores(class_inst)
+    print(scorekeep)
+
+    with open(
+            f"animal3-results-backup/results-{lambda_corr}/scores-cat-wo-{cat_co[0]}-{cat_co[1]}-{cat_co[2]}-cat-feature.txt",
+            "w+") as score_file:
+        score_file.write(str(scorekeep))
+
+    model.load_state_dict(torch.load(os.path.join(out_dir, "best.pt")))
+
+    model.cl.linear.weight = torch.nn.Parameter(disable_weight(model.cl.linear.weight, cat_co))
+    # print(model.cl.linear.weight.detach().cpu().numpy())
+    preds = []
+    class_inst = np.zeros((3, 3))
+
+    for i, (X, y) in enumerate(a10_val):
+        X = X.to(DEVICE)
+        X = X.unsqueeze(0)
+        outs = model(X)
+        _, predicted_labels = torch.max(outs, 1)
+        cla = predicted_labels.item()
+        label = y
+        preds.append(cla)
+        class_inst[label, cla] = class_inst[label, cla] + 1
+    fig, ax = plot_confusion_matrix(class_inst, a10_val.classes)
+    fig.savefig(
+        f"animal3-results-backup/results-{lambda_corr}/conf-mat-cat-wo-{cat_co[0]}-{cat_co[1]}-{cat_co[2]}-whole-feature.png")
+    plt.close(fig)
+
+    scorekeep = scores(class_inst)
+    print(scorekeep)
+
+    with open(
+            f"animal3-results-backup/results-{lambda_corr}/scores-cat-wo-{cat_co[0]}-{cat_co[1]}-{cat_co[2]}-whole-feature.txt",
+            "w+") as score_file:
+        score_file.write(str(scorekeep))
+exit()
+model.cl.linear.weight = torch.nn.Parameter(disable_weight(model.cl.linear.weight, non_point_))
+class_inst = np.zeros((3, 3))
+preds = []
+for i, (X, y) in enumerate(a10_val):
+    X = X.to(DEVICE)
+    X = X.unsqueeze(0)
+    outs = model(X)
+    _, predicted_labels = torch.max(outs, 1)
+    cla = predicted_labels.item()
+    label = y
+    preds.append(cla)
+    class_inst[label, cla] = class_inst[label, cla] + 1
+fig, ax = plot_confusion_matrix(class_inst, a10_val.classes)
+fig.savefig(f"animal3-results-backup/results-{lambda_corr}/conf-mat-non-point-disable.png")
+plt.close(fig)
+scorekeep = scores(class_inst)
+print(scorekeep)
+
+with open(f"animal3-results-backup/results-{lambda_corr}/scores-non-point-disable.txt",
+          "w+") as score_file:
+    score_file.write(str(scorekeep))
+
+model.load_state_dict(torch.load(os.path.join(out_dir, "best.pt")))
+class_inst = np.zeros((3, 3))
+preds = []
+for i, (X, y) in enumerate(a10_val):
+    X = X.to(DEVICE)
+    X = X.unsqueeze(0)
+    outs = model(X)
+    _, predicted_labels = torch.max(outs, 1)
+    cla = predicted_labels.item()
+    label = y
+    preds.append(cla)
+    class_inst[label, cla] = class_inst[label, cla] + 1
+# fig, ax = plot_confusion_matrix(class_inst, a10_val.classes)
+# fig.savefig(f"animal3-results-backup/results-{lambda_corr}/conf-mat-{classname}-wo-{dis}-whole-feature.png")
+# plt.close(fig)
+scorekeep = scores(class_inst)
+print(scorekeep)
+
+with open(f"animal3-results-backup/results-{lambda_corr}/scores-og.txt",
+          "w+") as score_file:
+    score_file.write(str(scorekeep))
+for classname, cattos in cattoes:
+    cat2 = combinations(cattos, 2)
+    feat_to_remove = [a10_val.classes.index(classname)]
+    # print(feat_to_remove)
+    for dis, co in cattos:
+        print(classname, dis)
+        if dis == "hp":
+            pass
+        else:
+            continue
+        co = sorted(co)
+        model.load_state_dict(torch.load(os.path.join(out_dir, "best.pt")))
+
+        model.cl.linear.weight = torch.nn.Parameter(disable_weight(model.cl.linear.weight, co))
+        # print(model.cl.linear.weight.detach().cpu().numpy())
+        preds = []
+        class_inst = np.zeros((3, 3))
+
+        for i, (X, y) in enumerate(a10_val):
+            X = X.to(DEVICE)
+            X = X.unsqueeze(0)
+            outs = model(X)
+            _, predicted_labels = torch.max(outs, 1)
+            cla = predicted_labels.item()
+            label = y
+            preds.append(cla)
+            class_inst[label, cla] = class_inst[label, cla] + 1
+        fig, ax = plot_confusion_matrix(class_inst, a10_val.classes)
+        fig.savefig(f"animal3-results-backup/results-{lambda_corr}/conf-mat-{classname}-wo-{dis}-whole-feature.png")
+        plt.close(fig)
+        scorekeep = scores(class_inst)
+        print(scorekeep)
+
+        with open(f"animal3-results-backup/results-{lambda_corr}/scores-{classname}-wo-{dis}-whole-feature.txt",
+                  "w+") as score_file:
+            score_file.write(str(scorekeep))
+        model.load_state_dict(torch.load(os.path.join(out_dir, "best.pt")))
+        model.cl.linear.weight = torch.nn.Parameter(disable_weight(model.cl.linear.weight, co, feat_to_remove))
+        # print(model.cl.linear.weight.detach().cpu().numpy())
+
+        preds = []
+        class_inst = np.zeros((3, 3))
+
+        for i, (X, y) in enumerate(a10_val):
+            X = X.to(DEVICE)
+            X = X.unsqueeze(0)
+            outs = model(X)
+            _, predicted_labels = torch.max(outs, 1)
+            cla = predicted_labels.item()
+            label = y
+            preds.append(cla)
+            class_inst[label, cla] = class_inst[label, cla] + 1
+        fig, ax = plot_confusion_matrix(class_inst, a10_val.classes)
+        fig.savefig(
+            f"animal3-results-backup/results-{lambda_corr}/conf-mat-{classname}-wo-{dis}-{classname}-feature.png")
+        plt.close(fig)
+        scorekeep = scores(class_inst)
+        print(scorekeep)
+
+        with open(f"animal3-results-backup/results-{lambda_corr}/scores-{classname}-wo-{dis}-{classname}-feature.txt",
+                  "w+") as score_file:
+            score_file.write(str(scorekeep))
+
+    for co in cat2:
+        (dis1, cat_co_1), (dis2, cat_co_2) = co
+        dis = dis1 + "_" + dis2
+
+        if "hp" in dis:
+            pass
+        else:
+            continue
+        print(classname, dis)
+        cat_co = sorted(cat_co_1 + cat_co_2)
+        model.load_state_dict(torch.load(os.path.join(out_dir, "best.pt")))
+
+        model.cl.linear.weight = torch.nn.Parameter(disable_weight(model.cl.linear.weight, cat_co))
+        # print(model.cl.linear.weight.detach().cpu().numpy())
+        preds = []
+        class_inst = np.zeros((3, 3))
+
+        for i, (X, y) in enumerate(a10_val):
+            X = X.to(DEVICE)
+            X = X.unsqueeze(0)
+            outs = model(X)
+            _, predicted_labels = torch.max(outs, 1)
+            cla = predicted_labels.item()
+            label = y
+            preds.append(cla)
+            class_inst[label, cla] = class_inst[label, cla] + 1
+        fig, ax = plot_confusion_matrix(class_inst, a10_val.classes)
+        fig.savefig(f"animal3-results-backup/results-{lambda_corr}/conf-mat-{classname}-wo-{dis}-whole-feature.png")
+        plt.close(fig)
+
+        scorekeep = scores(class_inst)
+        print(scorekeep)
+
+        with open(f"animal3-results-backup/results-{lambda_corr}/scores-{classname}-wo-{dis}-whole-feature.txt",
+                  "w+") as score_file:
+            score_file.write(str(scorekeep))
+
+        model.load_state_dict(torch.load(os.path.join(out_dir, "best.pt")))
+        model.cl.linear.weight = torch.nn.Parameter(disable_weight(model.cl.linear.weight, cat_co, feat_to_remove))
+        # print(model.cl.linear.weight.detach().cpu().numpy())
+        preds = []
+        class_inst = np.zeros((3, 3))
+
+        for i, (X, y) in enumerate(a10_val):
+            X = X.to(DEVICE)
+            X = X.unsqueeze(0)
+            outs = model(X)
+            _, predicted_labels = torch.max(outs, 1)
+            cla = predicted_labels.item()
+            label = y
+            preds.append(cla)
+            class_inst[label, cla] = class_inst[label, cla] + 1
+        fig, ax = plot_confusion_matrix(class_inst, a10_val.classes)
+        fig.savefig(
+            f"animal3-results-backup/results-{lambda_corr}/conf-mat-{classname}-wo-{dis}-{classname}-feature.png")
+        plt.close(fig)
+
+        scorekeep = scores(class_inst)
+        print(scorekeep)
+
+        with open(f"animal3-results-backup/results-{lambda_corr}/scores-{classname}-wo-{dis}-{classname}-feature.txt",
+                  "w+") as score_file:
+            score_file.write(str(scorekeep))
+exit()
 for i, (X, y) in enumerate(a10_val):
     X = X.to(DEVICE)
     X = X.unsqueeze(0)
@@ -350,10 +723,19 @@ for i, (X, y) in enumerate(a10_val):
     else:
         feats_all = np.concatenate([feats_all, feats], axis=0)
 
-ind = np.argsort(-feats_all, axis=0)[:230]
-feats_max = feats_all[ind, np.arange(feats_all.shape[1])]
-index_per_feat = ind.T
 
+# ind = np.argsort(-feats_all, axis=0)
+# feats_max = feats_all[ind, np.arange(feats_all.shape[1])]
+# index_per_feat = ind.T
+# index_per_feat_only_pos = []
+# for i, row in enumerate(index_per_feat):
+#     # print(row)
+#     index_per_feat_only_pos_row = []
+#     for c in row:
+#         if feats_all[c, i] > 0:
+#             index_per_feat_only_pos_row.append(c)
+#     index_per_feat_only_pos.append(index_per_feat_only_pos_row)
+#
 
 def batch_predict(images):
     model.eval()
@@ -389,49 +771,124 @@ def visualize_weights(W, feature_idx, class_names, show=False):
     return fig, ax
 
 
-explainer = lime_image.LimeImageExplainer()
+def visualize_contribution(feat_w_, class_names, show=False):
+    max_abs_W = np.max(np.abs(feat_w_)) + 0.1  # For plotting
+    fig, ax = plt.subplots()
+    fig.set_size_inches(9, 2)
+    W = feat_w_
+    ax.boxplot(W, vert=False, labels=class_names)
+    ax.set_xlim((-max_abs_W, max_abs_W))
+    ax.invert_yaxis()
+    ax.set_xlabel('Weights')
+    # ax.set_title(f'Feature {feature_idx}')
+    # for i, v in enumerate(W[feature_idx]):
+    #     if v >= 0:
+    #         ax.text(v + 0.01, i + .05, '%.4f' % (v), color='black')
+    #     else:
+    #         ax.text(v - 0.13, i + .05, '%.4f' % (v), color='black')
+    # if show:
+    #     plt.show()
+    return fig, ax
 
-for i, row in enumerate(index_per_feat):
-    if not os.path.exists(f"animal3-results/results-{lambda_corr}/{i}/"):
-        os.makedirs(f"animal3-results/results-{lambda_corr}/{i}/")
+
+explainer = lime_image.LimeImageExplainer()
+if not os.path.exists(f"animal3-results-backup/results-{lambda_corr}"):
+    os.makedirs(f"animal3-results-backup/results-{lambda_corr}")
+
+weight = model.cl.linear.weight.cpu().detach().numpy()
+bias = model.cl.linear.bias.cpu().detach().numpy()
+preds = np.argmax(feats_all @ weight.T + bias, axis=1)
+class_inst = np.zeros((3, 3))
+for i in range(len(a10_val)):
+    X, label = a10_val[i]
+    cla = preds[i]
+    class_inst[label, cla] = class_inst[label, cla] + 1
+fig, ax = plot_confusion_matrix(class_inst, a10_val.classes)
+fig.savefig(f"animal3-results-backup/results-{lambda_corr}/conf-mat.png")
+plt.close(fig)
+
+# if lambda_corr == 0.001:
+#     exit(0)
+for i, row in enumerate(feats_all.T):
+    # if i < 11:
+    #     continue
+
+    if not os.path.exists(f"animal3-results-backup/results-{lambda_corr}/{i}/"):
+        os.makedirs(f"animal3-results-backup/results-{lambda_corr}/{i}/")
     start = time.time()
-    weight = model.cl.linear.weight.cpu().detach().numpy()
+    w_feat = weight[:, i]
+    feat = feats_all[:, i]
+    feats_w_ = np.array([w_feat * f for f in feat])
     fig, ax = visualize_weights(weight, i, a10_val.classes)
-    fig.savefig(f"animal3-results/results-{lambda_corr}/{i}/weight_plot.png")
+    fig.savefig(f"animal3-results-backup/results-{lambda_corr}/{i}/weight_plot.png")
     plt.close(fig)
-    class_inst = {}
-    for col in row.tolist():
-        f = a10_val_wo_transform.files[col]
-        cname = os.path.dirname(f).split("/")[-1]
-        class_inst[cname] = class_inst.get(cname, 0) + 1
-    print(class_inst)
-    D = class_inst
-    plt.bar(range(len(D)), list(D.values()), align='center')
-    plt.xticks(range(len(D)), list(D.keys()))
-    plt.savefig(f"animal3-results/results-{lambda_corr}/{i}/most_activated.png")
-    plt.close()
-    row = row[:12]
-    for j, col in enumerate(row.tolist()):
+    fig, ax = visualize_contribution(feats_w_, a10_val.classes)
+    fig.savefig(f"animal3-results-backup/results-{lambda_corr}/{i}/contr_plot.png")
+    plt.close(fig)
+    fwshape = feats_w_.shape
+    feats_w_f = feats_w_.reshape(-1)
+    feats_ind = np.argsort(-feats_w_f)
+    feats_ind = list(set([f // fwshape[1] for f in feats_ind]))
+    class_inst = np.zeros((len(a10_val.classes), len(a10_val.classes)))
+    row_to_select = []
+
+    # class_inst = []
+    # class_inst_pred = []
+    for col in feats_ind:
+        cla = preds[col]
+        if feats_w_[col, cla] <= 0:
+            continue
+        X, label = a10_val[col]
+        class_inst[label, cla] = class_inst[label, cla] + 1
+        row_to_select.append([col, 1 if feat[col] > 0 else -1])
+    if len(row_to_select) < 1:
+        continue
+    fig, ax = plot_confusion_matrix(class_inst, a10_val.classes)
+    fig.savefig(f"animal3-results-backup/results-{lambda_corr}/{i}/conf-mat.png")
+    plt.close(fig)
+    # rselect = [int(cl + col * 3) for col, cl in row_to_select]
+    fmax = np.array([np.max(feats_w_[col, :]) for col, _ in row_to_select])
+    inds = np.random.choice(len(row_to_select), min(45, len(row_to_select)), p=(fmax / np.sum(fmax)), replace=False)
+
+    row = [row_to_select[i] for i in inds]
+
+    for j, (col, sign) in enumerate(row):
+
+        cla = preds[col]
         image, label = a10_val_wo_transform[col]
 
         image2 = np.uint8(image.numpy().transpose(1, 2, 0) * 255)
         image_org = image2.copy()
-        image3 = cv2.resize(image2, (224, 224))
+        wh = (224, 224)
+        image3 = cv2.resize(image2, wh)
         explanation = explainer.explain_instance(image3, batch_predict, (i,),
                                                  top_labels=None,
                                                  hide_color=0,
                                                  num_samples=1000,
                                                  batch_size=256,
                                                  random_seed=RANDOM_SEED)
-        _, mask = explanation.get_image_and_mask(i)
-        h, w = image_org.shape[:2]
-        mask = np.float32(cv2.resize(np.float32(mask), (w, h)) > 0)
+        # _, mask = explanation.get_image_and_mask(i, positive_only=False)
+        exp = explanation.local_exp[i]
+        mask = np.zeros(explanation.segments.shape, explanation.segments.dtype)
+
+        if sign > 0:
+            fs = [x[0] for x in exp
+                  if x[1] > 0]
+        else:
+            fs = [x[0] for x in exp
+                  if x[1] < 0]
+
+        for f in fs:
+            mask[explanation.segments == f] = 1
+        h, w = image3.shape[:2]
+        image2 = cv2.resize(image2, wh)
         image2 = np.uint8(image2 * np.dstack([mask for _ in range(3)]))
 
         image2 += np.uint8(np.ones_like(image2) * 127 * np.dstack([1 - mask for _ in range(3)]))
-
-        cv2.imwrite(f"animal3-results/results-{lambda_corr}/{i}/{j}-{col}.png",
-                    np.uint8(cv2.cvtColor(np.vstack([image2, image_org]), cv2.COLOR_RGB2BGR)))
+        nnnnname = "neg" if sign < 0 else "pos"
+        cv2.imwrite(
+            f"animal3-results-backup/results-{lambda_corr}/{i}/{j}-{col}-{nnnnname}-{a10_val.classes[cla]}-{a10_val.classes[label]}-({feat[col]}).png",
+            np.uint8(cv2.cvtColor(np.vstack([image2, image3]), cv2.COLOR_RGB2BGR)))
         print(f"{lambda_corr}/{i}/{j}-{col}")
     end = time.time()
 
